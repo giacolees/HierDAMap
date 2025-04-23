@@ -179,7 +179,7 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
                 straingenerator = iter(strainloader)
                 imgs, rots, trans, intrins, post_rots, post_trans, lidars, binimgs_s, seg_mask_s = next(straingenerator)
 
-            seg_mask = rearrange(seg_mask_s, 'b n c h w -> (b n) c h w')
+            seg_mask = rearrange(seg_mask_s.mean(dim=-1), 'b n c h w -> (b n) c h w')
             lidars_i = rearrange(lidars, 'b n c h w -> (b n) c h w')
             preds, depth, pv_out, x_bev, x_mini, mask_mini, pred_car = student_model(imgs.to(device), rots.to(device),
                                                                                      trans.to(device), intrins.to(device),
@@ -218,7 +218,7 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
                                                                                                 un_post_rots_ori.to(device),
                                                                                                 un_post_trans_ori.to(device),
                                                                                                 None, )
-            seg_mask_un = rearrange(seg_mask_t, 'b n c h w -> (b n) c h w')
+            seg_mask_un = rearrange(seg_mask_t.mean(dim=-1), 'b n c h w -> (b n) c h w')
             preds_un, _, pv_out_un, x_bev_un, x_mini_un, mask_mini_un, pred_car_un = student_model(un_image.to(device), un_rots.to(device),
                                                                                                    un_trans.to(device), un_intrins.to(device),
                                                                                                    un_post_rots.to(device), un_post_trans.to(device), None,
@@ -238,8 +238,8 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
 
 
             ###mini bev
-            x_mini = torch.cat((x_mini, x_mini_un, x_mini_droup), dim=1)  #
-            mask_mini = torch.cat((mask_mini, mask_mini_un, mask_mini_droup), dim=1)  # ,mask_mini_un_ori
+            x_mini = torch.cat((x_mini, x_mini_un), dim=1)  #
+            mask_mini = torch.cat((mask_mini, mask_mini_un), dim=1)  # ,mask_mini_un_ori
             loss_mbs = 0.1 * w1 * loss_mini(x_mini, mask_mini)
 
 
@@ -304,7 +304,7 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
 
 
 if __name__ == '__main__':
-    version =  'v1.0-trainval'#'v1.0-mini'#
+    version =  'v1.0-mini'
     grid_conf = {
         'xbound': [-30.0, 30.0, 0.15],
         'ybound': [-15.0, 15.0, 0.15],
@@ -330,7 +330,7 @@ if __name__ == '__main__':
     n = 0
     source = source_name_list[n]
     target = target_name_list[n]
-    train(logdir='./ours_mapping_' + source+'_'+target+'_2', version=version, dataroot='',
+    train(logdir='./ours_mapping_' + source+'_'+target+'_2', version=version, dataroot='./nuscenes_mini',
           grid_conf=grid_conf, data_aug_conf=data_aug_conf,
           domain_gap=True, source=source, target=target, nsweeps=3,
           bsz=b, nworkers=6, lr=lr, weight_decay=1e-2, nepochs=24, )

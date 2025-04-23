@@ -19,7 +19,7 @@ from nuscenes.utils.geometry_utils import transform_matrix
 from nuscenes.map_expansion.map_api import NuScenesMap
 from PIL import Image, ImageFilter
 import cv2
-from .hsda import *
+#from .hsda import *
 MAP_PALETTE = {
     "drivable_area": (166, 206, 227),
     "road_segment": (31, 120, 180),

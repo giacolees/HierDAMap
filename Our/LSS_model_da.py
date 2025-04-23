@@ -546,8 +546,6 @@ class LiftSplatShoot_mix(LiftSplatShoot):
         return x, depth, pv_out, x_bev_init,x_mix,mb
 
 
-from .loss_edl import edl_mse_loss,edl_log_loss,edl_digamma_loss
-
 
 class LiftSplatShoot_mask_mix(LiftSplatShoot):
     def __init__(self, grid_conf, data_aug_conf, outC,aux_out=1,mid_ch=1):

@@ -58,7 +58,7 @@ class MappingNuscData(torch.utils.data.Dataset):
         canvasx = (self.xbound[1] - self.xbound[0]) / self.xbound[2]  # 400
         canvasy = (self.ybound[1] - self.ybound[0]) / self.ybound[2]  # 200
         self.canvas_size = (int(canvasx), int(canvasy))  # 512 512
-        self.vector_map = VectorizedLocalMap('/data0/lsy/dataset/nuScenes/v1.0', patch_size=self.patch_size,
+        self.vector_map = VectorizedLocalMap('./nuscenes_mini', patch_size=self.patch_size,
                                              canvas_size=self.canvas_size)
         self.aug_mode = data_aug_conf['Aug_mode']
         self.use_lidar = data_aug_conf['lidar'] if 'lidar' in data_aug_conf else True
@@ -242,7 +242,7 @@ class MappingNuscData(torch.utils.data.Dataset):
         for cam in cams:
             samp = self.nusc.get('sample_data', rec['data'][cam])
 
-            path = '/data1/lsy/nuscenes_semanti_mask'
+            path = 'nuscenes_mini/samples/'
             cam_path = os.path.join(path, samp['filename'][8:])
             image_gray = Image.open(cam_path)
 
@@ -458,7 +458,7 @@ class FlipMappingNuscData(MappingNuscData):
         flip_g = []
         for cam in cams:
             samp = self.nusc.get('sample_data', rec['data'][cam])
-            path = 'xx/nuscenes_semanti_mask'
+            path = 'nuscenes_mini/samples/'
             cam_path = os.path.join(path, samp['filename'][8:])
             mask_o = Image.open(cam_path)
 

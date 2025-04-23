@@ -1,2 +1,5 @@
 # Exclude all PNG files
 *.png
+nuscenes_mini
+**/__pycache__/
+ours_mapping_boston_singapore_2

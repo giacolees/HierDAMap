@@ -1,0 +1,18 @@
+services:
+  hierdamap:
+    build: .
+    image: hierdamap:latest
+    shm_size: 8g 
+    container_name: hierdamap
+    volumes:
+      - .:/app
+      - ./data:/app/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    tty: true
+    stdin_open: true
