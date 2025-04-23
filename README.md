@@ -51,12 +51,12 @@ The exploration of Bird's-Eye View (BEV) mapping technology has driven significa
 We provide a Makefile for convenient operation. 
 Here are the available commands:
 
-make build    # Build the Docker image
-make up       # Start the container in detached mode
-make down     # Stop the container
-make train    # Run the training script
-make test     # Run the testing script
-make clean    # Stop container and remove volumes
+- make build    # Build the Docker image
+- make up       # Start the container in detached mode
+- make down     # Stop the container
+- make train    # Run the training script
+- make test     # Run the testing script to check if the installation worked 
+- make clean    # Stop container and remove volumes
 
 #### Step-by-step guide 
 1. First, build the Docker image (this may take several minutes)
