@@ -3,3 +3,6 @@
 nuscenes_mini
 **/__pycache__/
 ours_mapping_boston_singapore_2
+requirements.txt
+requirements_conda.txt
+environment.yml
