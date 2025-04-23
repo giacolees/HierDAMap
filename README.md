@@ -41,11 +41,10 @@ The exploration of Bird's-Eye View (BEV) mapping technology has driven significa
 ### Installation
 #### Prerequisites
 
-Docker installed (Docker installation guide)
-NVIDIA GPU + NVIDIA drivers installed
-NVIDIA Container Toolkit (for Docker GPU support)
-Nuscenes mini dataset from https://www.nuscenes.org/nuscenes with maps expansions
-Import into the folder with name: "nuscenes_mini"
+1. Docker installed (Docker installation guide)
+2. NVIDIA GPU + NVIDIA drivers installed
+3. NVIDIA Container Toolkit (for Docker GPU support)
+4. Nuscenes mini dataset from https://www.nuscenes.org/nuscenes with maps expansions, import into the folder with name: "nuscenes_mini"
 
 #### Quick Start Commands
 
