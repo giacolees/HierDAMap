@@ -1,7 +1,12 @@
 # Exclude all PNG files
 *.png
+
 nuscenes_mini
+
+# Exclude all files in the __pycache__ directory
 **/__pycache__/
+
+
 ours_mapping_boston_singapore_2
 requirements.txt
 requirements_conda.txt
