@@ -3,8 +3,8 @@ From: nvidia/cuda:12.6.0-runtime-ubuntu22.04
 Stage: spython-base
 
 %files
-requirements_f.txt .
-. .
+requirements_f.txt /app/requirements_f.txt
+
 %post
 
 # Set working directory
@@ -14,6 +14,10 @@ cd /app
 # Set environment variables
 PYTHONUNBUFFERED=1
 DEBIAN_FRONTEND=noninteractive
+
+TZ=Etc/UTC && \
+    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
+    echo $TZ > /etc/timezone
 
 # Install system dependencies
 apt-get update && apt-get install -y \
@@ -38,9 +42,8 @@ pip install -r requirements_f.txt
 %environment
 export PYTHONUNBUFFERED=1
 export DEBIAN_FRONTEND=noninteractive
+export TZ=Europe/Berlin
+
 %runscript
-cd /app
-exec /bin/bash "$@"
-%startscript
 cd /app
 exec /bin/bash "$@"
