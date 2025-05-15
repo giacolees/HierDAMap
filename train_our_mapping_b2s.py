@@ -2,6 +2,8 @@ import os
 
 #os.environ["CUDA_VISIBLE_DEVICES"] = '1'
 import torch
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
 import time
 from tensorboardX import SummaryWriter
 import numpy as np
@@ -14,72 +16,11 @@ from tools import *
 from torch.optim import SGD, AdamW, Adam
 from torch.optim.lr_scheduler import MultiStepLR, StepLR
 from Our.confusion import BinaryConfusionMatrix, singleBinary
+from Our.loss import SegmentationLoss
 
 score_th = 0.5
 
-class SegmentationLoss(nn.Module):
-    def __init__(self, class_weights, ignore_index=255, use_top_k=False,
-                 top_k_ratio=1.0, future_discount=1.0,weight=1.0):
-
-        super().__init__()
-
-        self.class_weights = torch.tensor(class_weights).float()
-        self.ignore_index = ignore_index
-        self.use_top_k = use_top_k
-        self.top_k_ratio = top_k_ratio
-        self.future_discount = future_discount
-        self.weight = weight
-
-
-    def forward(self, prediction, target):
-        b,c, h, w = prediction.shape
-        loss = F.cross_entropy(
-            prediction,
-            target,
-            reduction='none',
-            weight=self.class_weights.to(target.device).float(),
-        )
-
-        # ce_loss = self.ce_criterion(prediction, target)
-        # pred_logsoftmax = F.log_softmax(prediction)
-        # loss = self.nll_criterion(pred_logsoftmax, target)
-
-        loss = loss.view(b,  -1)
-        if self.use_top_k:
-            # Penalises the top-k hardest pixels
-            k = int(self.top_k_ratio * loss.shape[2])
-            loss, _ = torch.sort(loss, dim=2, descending=True)
-            loss = loss[:, :, :k]
-        m = loss.mean()
-        return self.weight*m
-
-def onehot_encoding_mapping(logits, dim=1):
-    max_idx = torch.argmax(logits, dim, keepdim=True)
-    one_hot = logits.new_full(logits.shape, 0)
-    one_hot.scatter_(dim, max_idx, 1)
-    return one_hot
-
-def get_batch_iou_mapping(preds, binimgs):
-    """Assumes preds has NOT been sigmoided yet
-    """
-    intersects = []
-    unions = []
-    with torch.no_grad():
-        pred_map = preds.bool()
-        gt_map = binimgs.bool()
-        for i in range(pred_map.shape[1]):
-            pred = pred_map[:, i]
-            tgt = gt_map[:, i]
-            intersect = (pred & tgt).sum().float()
-            union = (pred | tgt).sum().float()
-            intersects.append(intersect)
-            unions.append(union)
-    intersects, unions =  torch.tensor(intersects), torch.tensor(unions)
-    return intersects, unions, intersects / (unions  + 1e-7)
-
 def get_val_info(model, valloader, device, use_tqdm=True):
-
-    total_loss = 0.0
     total_intersect = 0.0
     total_union = 0
     confusion_c = BinaryConfusionMatrix(1)
@@ -118,18 +59,23 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
     logger = logging.getLogger()
     logger.addHandler(logging.StreamHandler(sys.stdout))
     logger.info("Lidar Sup + Mini BEV Sup")
+
+    #train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    
     strainloader, ttrainloader, tvalloader = compile_data_mapping(version, dataroot, data_aug_conf, grid_conf, nsweeps, domain_gap, source, target, bsz,
                                                                  nworkers, flip=True)
 
     straingenerator = iter(strainloader)
     ttraingenerator = iter(ttrainloader)
-    if len(strainloader) < len(ttrainloader):
-        datalen = len(ttrainloader)
-    else:
-        datalen = len(strainloader)
+
+    datalen = len(strainloader) if len(strainloader) > len(ttrainloader) else len(ttrainloader)
+
+    #local_rank = int(os.environ["LOCAL_RANK"])
+    #torch.cuda.set_device(local_rank)
 
     device = torch.device(f'cuda:{gpuid}')
 
+    
     student_model = LiftSplatShoot_mask_mix(grid_conf, data_aug_conf, outC=4)
     teacher_model = LiftSplatShoot_mask_mix(grid_conf, data_aug_conf, outC=4)
     student_model.to(device)
@@ -195,9 +141,11 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
             loss_p = wp * loss_pv(pv_out, seg_mask.cuda())
             loss_d, d_isnan = loss_depth(depth, lidars.to(device))
             loss_d = 0.1 * loss_d
-            # visual((binimgs[0] > 0.2).detach().cpu())
-            # visual((preds.sigmoid()[0] > 0.2).detach().cpu())
+            
+            #visual((binimgs[0] > 0.2).detach().cpu())
+            #visual((preds.sigmoid()[0] > 0.2).detach().cpu())
             ###target
+
             try:
                 un_image, un_rots, un_trans, un_intrins, un_post_rots, un_post_trans, un_lidars, un_binimgs_t, \
                     un_img_ori, un_post_rots_ori, un_post_trans_ori, seg_mask_t, seg_mask_o = next(ttraingenerator)
@@ -290,20 +238,23 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
 
             iteration += 1
         sched.step()
-        if True:
-            val_info = get_val_info(teacher_model, tvalloader, device, )
+        
+        val_info = get_val_info(teacher_model, tvalloader, device, )
 
-            logger.info(f"TargetVAL[{epo:>2d}]:    "
-                        f"mIOU_car: {val_info['miou_car']:>7.4f}  "
-                        f"TargetIOU: {np.array2string(val_info['iou'][1:].cpu().numpy(), precision=3, floatmode='fixed')}  "
-                        f"mIOU: {val_info['miou']:>7.4f}  "
-                        )
-            mname = os.path.join(logdir, "model{}.pt".format(epo))
-            print('saving', mname)
-            torch.save(teacher_model.state_dict(), mname)
+        logger.info(f"TargetVAL[{epo:>2d}]:    "
+                    f"mIOU_car: {val_info['miou_car']:>7.4f}  "
+                    f"TargetIOU: {np.array2string(val_info['iou'][1:].cpu().numpy(), precision=3, floatmode='fixed')}  "
+                    f"mIOU: {val_info['miou']:>7.4f}  "
+                    )
+        mname = os.path.join(logdir, "model{}.pt".format(epo))
+        print('saving', mname)
+        torch.save(teacher_model.state_dict(), mname)
 
 
 if __name__ == '__main__':
+
+    #dist.init_process_group(backend='mpi')
+    
     version =  'v1.0-mini'
     grid_conf = {
         'xbound': [-30.0, 30.0, 0.15],
@@ -326,11 +277,9 @@ if __name__ == '__main__':
     b = 10
     lr = 1e-3*b/4
     source_name_list = ['boston', 'singapore', 'day', 'dry']
-    target_name_list = ['singapore', 'boston', 'night', 'rain']
-    n = 0
-    source = source_name_list[n]
-    target = target_name_list[n]
+    source = source_name_list[0]
+    target = source_name_list[1]
     train(logdir='./ours_mapping_' + source+'_'+target+'_2', version=version, dataroot='./nuscenes_mini',
           grid_conf=grid_conf, data_aug_conf=data_aug_conf,
           domain_gap=True, source=source, target=target, nsweeps=3,
-          bsz=b, nworkers=6, lr=lr, weight_decay=1e-2, nepochs=24, )
+          bsz=b, nworkers=6, lr=lr, weight_decay=1e-2, nepochs=50, gpuid=0)

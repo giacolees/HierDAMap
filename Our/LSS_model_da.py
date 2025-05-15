@@ -69,7 +69,7 @@ class BevEncode(nn.Module):
     def __init__(self, inC, outC,aux_out=1):
         super(BevEncode, self).__init__()
 
-        trunk = resnet18(pretrained=False, zero_init_residual=True)
+        trunk = resnet18(zero_init_residual=True)
         self.conv1 = nn.Conv2d(inC, 64, kernel_size=7, stride=2, padding=3,
                                bias=False)
         self.bn1 = trunk.bn1
@@ -774,7 +774,4 @@ class LiftSplatShoot_mask_mix(LiftSplatShoot):
 
         x, x_car = self.bevencode(x_bev_init)
         return x, depth, pv_out, x_bev_init, x_mini, mask_b,x_car
-
-
-
 
