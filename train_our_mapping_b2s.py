@@ -16,10 +16,10 @@ from torch.optim import SGD, AdamW, Adam
 from torch.optim.lr_scheduler import MultiStepLR, StepLR
 from Our.confusion import BinaryConfusionMatrix, singleBinary
 from Our.loss import SegmentationLoss
-from utils import distributed_context
+from utils import distributed_context, get_rank
+from torch.utils.tensorboard import SummaryWriter
 
 score_th = 0.5
-torch.autograd.set_detect_anomaly(True)
 
 def get_val_info(model, valloader, device, use_tqdm=True):
     total_intersect = 0.0
@@ -50,7 +50,7 @@ def get_val_info(model, valloader, device, use_tqdm=True):
 
 
 def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_gap, source, target, bsz, nworkers, lr, weight_decay, nepochs,
-          max_grad_norm=5.0, gpuid=0, is_distributed=False, use_tqdm=True):
+          max_grad_norm=5.0, gpuid=0, use_tqdm=True):
     if not os.path.exists(logdir):
         os.mkdir(logdir)
     logging.basicConfig(filename=os.path.join(logdir, "results.log"),
@@ -62,15 +62,18 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
     logger = logging.getLogger()
     logger.addHandler(logging.StreamHandler(sys.stdout))
 
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
     # Set up data loaders
-    strainloader, ttrainloader, tvalloader, sampler_strain, sampler_ttrain = compile_data_mapping(
+    strainloader, ttrainloader, tvalloader, sampler_strain, sampler_ttrain, sampler_tval = compile_data_mapping(
         version, dataroot, data_aug_conf, grid_conf, nsweeps, domain_gap, source, target, bsz,
-        nworkers, flip=True, is_distributed=is_distributed
+        nworkers, flip=True, is_distributed=dist.is_initialized()
     )
     
     datalen = min(len(strainloader), len(ttrainloader))
 
-    if use_tqdm and dist.get_rank()==0:
+    if (dist.is_initialized() == False):
         strainloader = tqdm(strainloader)
         ttrainloader = tqdm(ttrainloader)
 
@@ -84,7 +87,7 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
     teacher_model.to(device)
 
     # Set up distributed training if needed
-    if is_distributed:
+    if dist.is_initialized():
         # Important: Use SyncBatchNorm to synchronize BN statistics across processes
         student_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(student_model)
         teacher_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(teacher_model)
@@ -94,7 +97,7 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
         teacher_model = DDP(teacher_model, device_ids=[gpuid], find_unused_parameters=True)
         
         # Get local rank for logging
-        local_rank = dist.get_rank()
+        local_rank = get_rank()
         logger.info(f"Initialized process with rank {local_rank}")
 
     # Set up loss functions
@@ -122,15 +125,19 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
 
     # Start training loop
     for epo in range(1, nepochs + 1):
+
+        start_event.record()
+
         # Synchronize at epoch start
-        if is_distributed:
+        if dist.is_initialized():
             dist.barrier()
-            local_rank = dist.get_rank()
+            local_rank = get_rank()
             logger.info(f"Starting Epoch {epo} for rank: {local_rank}")
             
             # Set different seeds for each process to ensure data diversity
             sampler_strain.set_epoch(epo)
             sampler_ttrain.set_epoch(epo)
+            sampler_tval.set_epoch(epo)
         
         # Set models to correct modes
         student_model.train()
@@ -144,7 +151,6 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
         
         # Training loop for current epoch
         for batch_idx, (batch_strain_data, batch_ttrain_data) in enumerate(zip(strainloader, ttrainloader)):
-            t0 = time.time()
             
             # Process source domain data (student)
             imgs, rots, trans, intrins, post_rots, post_trans, lidars, binimgs_s, seg_mask_s = batch_strain_data
@@ -275,7 +281,7 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
             with torch.no_grad():
 
                 # Get state dictionaries with proper handling for DDP
-                if is_distributed:
+                if dist.is_initialized():
                     student_dict = student_model.module.state_dict()
                     teacher_dict = teacher_model.module.state_dict()
                 else:
@@ -288,16 +294,16 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
                         teacher_dict[k] = teacher_dict[k] * alpha + student_dict[k] * (1 - alpha)
                 
                 # Load updated weights back to teacher model
-                if is_distributed:
+                if dist.is_initialized():
                     teacher_model.module.load_state_dict(teacher_dict)
                 else:
                     teacher_model.load_state_dict(teacher_dict)
 
-            if is_distributed:
+            if dist.is_initialized():
                 dist.barrier()
             
             # Logging (only from main process)
-            if (not is_distributed or dist.get_rank() == 0) and batch_idx == datalen-1:
+            if (not dist.is_initialized() or get_rank() == 0):
                 # Calculate IoU metrics
                 _, _, iou = get_batch_iou_mapping(onehot_encoding_mapping(preds), binimgs_s['iou'].to(device))
                 _, _, iou_un = get_batch_iou_mapping(onehot_encoding_mapping(preds_un_ori), un_binimgs_t['iou'].to(device))
@@ -322,7 +328,7 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
         sched.step()
         
         # Validation after each epoch (only on main process)
-        if not is_distributed or dist.get_rank() == 0:
+        if not dist.is_initialized() or get_rank() == 0:
             # Run validation
             val_info = get_val_info(teacher_model, tvalloader, device)
             
@@ -338,7 +344,7 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
             print('saving', mname)
             
             # Save state dict with proper handling for DDP
-            if is_distributed:
+            if dist.is_initialized():
                 state_dict = teacher_model.module.state_dict()
             else:
                 state_dict = teacher_model.state_dict()
@@ -346,8 +352,12 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
             torch.save(state_dict, mname)
         
         # Synchronize before next epoch
-        if is_distributed:
+        if dist.is_initialized():
             dist.barrier()
+
+        end_event.record()
+        elapsed_time = start_event.elapsed_time(end_event)
+        print(f"Execution time: {elapsed_time:.2f} ms")
 
 
 if __name__ == '__main__':
@@ -398,7 +408,7 @@ if __name__ == '__main__':
         train(logdir='./ours_mapping_' + source+'_'+target+'_2', version=version, dataroot='./nuscenes_mini',
             grid_conf=grid_conf, data_aug_conf=data_aug_conf,
             domain_gap=True, source=source, target=target, nsweeps=3,
-            bsz=b, nworkers=6, lr=lr, weight_decay=1e-2, nepochs=50, gpuid=idx_gpu, is_distributed=is_distributed, use_tqdm=True)
+            bsz=b, nworkers=6, lr=lr, weight_decay=1e-2, nepochs=50, gpuid=idx_gpu, use_tqdm=True)
 
         if rank == 0:
             print("Benchmark finished.")

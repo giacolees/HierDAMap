@@ -35,7 +35,7 @@ class SyntheticDataset(Dataset):
         return data, target
         
 @contextmanager
-def distributed_context(backend='nccl', timeout_seconds=30, is_distributed=False):
+def distributed_context(backend='nccl', timeout_seconds=10, is_distributed=False):
     """Context manager for distributed setup and cleanup."""
     rank = -1
     world_size = -1
@@ -56,7 +56,7 @@ def distributed_context(backend='nccl', timeout_seconds=30, is_distributed=False
     if 'MASTER_ADDR' not in os.environ:
         os.environ['MASTER_ADDR'] = 'localhost'
     if 'MASTER_PORT' not in os.environ:
-        os.environ['MASTER_PORT'] = '30002'
+        os.environ['MASTER_PORT'] = '30005'
 
     if is_distributed:
         
@@ -94,3 +94,9 @@ def distributed_context(backend='nccl', timeout_seconds=30, is_distributed=False
         elif not is_distributed:
             if rank == 0:
                 print("Non-distributed mode: No distributed resources to clean up.")
+
+def get_rank():
+    try:
+        return dist.get_rank()
+    except:
+        return -1

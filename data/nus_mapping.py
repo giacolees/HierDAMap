@@ -623,26 +623,30 @@ def compile_data_mapping(version, dataroot, data_aug_conf, grid_conf,nsweeps,  d
 
     sampler_strain = DistributedSampler(straindata, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=True) if is_distributed else None
     sampler_ttrain = DistributedSampler(ttraindata, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=True) if is_distributed else None
+    sampler_tval = DistributedSampler(tvaldata, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False) if is_distributed else None
 
     strainloader = torch.utils.data.DataLoader(straindata, batch_size=bsz,
                                                num_workers=nworkers,
                                                drop_last=True,
                                                sampler=sampler_strain,
                                                worker_init_fn=worker_rnd_init,
-                                               pin_memory = True
+                                               pin_memory = True if dist.is_initialized() else False
                                                )
     ttrainloader = torch.utils.data.DataLoader(ttraindata, batch_size=bsz,
                                                num_workers=nworkers,
                                                drop_last=True,
                                                sampler=sampler_ttrain,
                                                worker_init_fn=worker_rnd_init,
-                                               pin_memory = True
+                                               pin_memory = True if dist.is_initialized() else False
                                                )
     tvalloader = torch.utils.data.DataLoader(tvaldata, batch_size=bsz,
-                                             shuffle=False,
-                                             num_workers=nworkers)
+                                             drop_last=True,
+                                             num_workers=nworkers,
+                                             sampler=sampler_tval,
+                                             pin_memory = True if dist.is_initialized() else False
+                                             )
     
-    return strainloader,ttrainloader,tvalloader, sampler_strain, sampler_ttrain
+    return strainloader,ttrainloader,tvalloader, sampler_strain, sampler_ttrain, sampler_tval
 
 
 def compile_data_mapping_source(version, dataroot, data_aug_conf, grid_conf,nsweeps,  domain_gap,source,target,  bsz,nworkers,flip=False, is_distributed=False):
