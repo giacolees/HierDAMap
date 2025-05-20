@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.optim.optimizer import Optimizer
 import torchvision
+from Our.confusion import BinaryConfusionMatrix
 
 
 def vis_mapping(semantic,):
@@ -702,3 +703,32 @@ class FocalLoss(nn.Module):
             str: The name of this loss item.
         """
         return self._loss_name
+
+
+def onehot_encoding_mapping(logits, dim=1):
+    max_idx = torch.argmax(logits, dim, keepdim=True)
+    one_hot = logits.new_full(logits.shape, 0)
+    one_hot.scatter_(dim, max_idx, 1)
+    return one_hot
+
+def get_batch_iou_mapping(preds, binimgs):
+    """Assumes preds has NOT been sigmoided yet
+    """
+    intersects = []
+    unions = []
+    with torch.no_grad():
+        pred_map = preds.bool()
+        gt_map = binimgs.bool()
+        for i in range(pred_map.shape[1]):
+            pred = pred_map[:, i]
+            tgt = gt_map[:, i]
+            intersect = (pred & tgt).sum().float()
+            union = (pred | tgt).sum().float()
+            intersects.append(intersect)
+            unions.append(union)
+    intersects, unions =  torch.tensor(intersects), torch.tensor(unions)
+    return intersects, unions, intersects / (unions  + 1e-7)
+
+
+
+    

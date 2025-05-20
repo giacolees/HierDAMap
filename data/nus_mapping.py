@@ -15,6 +15,8 @@ from .tools import img_transform_simple
 from .vector_map import VectorizedLocalMap
 from .rasterize import preprocess_map
 from .splits import create_splits_scenes
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
 IMG_ORIGIN_H = 900
 IMG_ORIGIN_W = 1600
 
@@ -44,8 +46,9 @@ class MappingNuscData(torch.utils.data.Dataset):
         self.ixes = self.prepro()
 
         dx, bx, nx = gen_dx_bx(grid_conf['xbound'], grid_conf['ybound'], grid_conf['zbound'])
-        self.dx, self.bx, self.nx = dx.numpy(), bx.numpy(), nx.numpy()
 
+
+        self.dx, self.bx, self.nx = dx.numpy(), bx.numpy(), nx.numpy()    
         if self.is_lyft is False:
             self.fix_nuscenes_formatting()
         self.thickness = 3
@@ -58,14 +61,11 @@ class MappingNuscData(torch.utils.data.Dataset):
         canvasx = (self.xbound[1] - self.xbound[0]) / self.xbound[2]  # 400
         canvasy = (self.ybound[1] - self.ybound[0]) / self.ybound[2]  # 200
         self.canvas_size = (int(canvasx), int(canvasy))  # 512 512
-        self.vector_map = VectorizedLocalMap('./nuscenes_mini', patch_size=self.patch_size,
+        self.vector_map = VectorizedLocalMap(self.nusc.dataroot, patch_size=self.patch_size,
                                              canvas_size=self.canvas_size)
         self.aug_mode = data_aug_conf['Aug_mode']
         self.use_lidar = data_aug_conf['lidar'] if 'lidar' in data_aug_conf else True
 
-        print(self)
-        print(self.__len__(), data_aug_conf['Aug_mode'])
-        print(self.use_lidar)
 
     def fix_nuscenes_formatting(self):
         """If nuscenes is stored with trainval/1 trainval/2 ... structure, adjust the file paths
@@ -242,7 +242,7 @@ class MappingNuscData(torch.utils.data.Dataset):
         for cam in cams:
             samp = self.nusc.get('sample_data', rec['data'][cam])
 
-            path = 'nuscenes_mini/samples/'
+            path = self.nusc.dataroot+'/samples/'
             cam_path = os.path.join(path, samp['filename'][8:])
             image_gray = Image.open(cam_path)
 
@@ -458,7 +458,7 @@ class FlipMappingNuscData(MappingNuscData):
         flip_g = []
         for cam in cams:
             samp = self.nusc.get('sample_data', rec['data'][cam])
-            path = 'nuscenes_mini/samples/'
+            path = self.nusc.dataroot+'/samples/'
             cam_path = os.path.join(path, samp['filename'][8:])
             mask_o = Image.open(cam_path)
 
@@ -604,7 +604,8 @@ class FlipMappingNuscData(MappingNuscData):
 def worker_rnd_init(x):
     np.random.seed(13 + x)
 
-def compile_data_mapping(version, dataroot, data_aug_conf, grid_conf,nsweeps,  domain_gap,source,target,  bsz,nworkers,flip=False):
+def compile_data_mapping(version, dataroot, data_aug_conf, grid_conf,nsweeps,  domain_gap,source,target,  bsz,nworkers,flip=False, is_distributed = False):
+
     nusc = NuScenes(version=version,
                     dataroot=dataroot,
                     verbose=False)
@@ -619,25 +620,33 @@ def compile_data_mapping(version, dataroot, data_aug_conf, grid_conf,nsweeps,  d
                       grid_conf=grid_conf, nsweeps=nsweeps,
                       domain_gap=domain_gap, domain=target, domain_type='tval')
 
+
+    sampler_strain = DistributedSampler(straindata, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=True) if is_distributed else None
+    sampler_ttrain = DistributedSampler(ttraindata, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=True) if is_distributed else None
+
     strainloader = torch.utils.data.DataLoader(straindata, batch_size=bsz,
-                                               shuffle=True,
                                                num_workers=nworkers,
                                                drop_last=True,
-                                               worker_init_fn=worker_rnd_init
+                                               sampler=sampler_strain,
+                                               worker_init_fn=worker_rnd_init,
+                                               pin_memory = True
                                                )
     ttrainloader = torch.utils.data.DataLoader(ttraindata, batch_size=bsz,
-                                               shuffle=True,
                                                num_workers=nworkers,
                                                drop_last=True,
-                                               worker_init_fn=worker_rnd_init
+                                               sampler=sampler_ttrain,
+                                               worker_init_fn=worker_rnd_init,
+                                               pin_memory = True
                                                )
     tvalloader = torch.utils.data.DataLoader(tvaldata, batch_size=bsz,
                                              shuffle=False,
                                              num_workers=nworkers)
-    return strainloader,ttrainloader,tvalloader
+    
+    return strainloader,ttrainloader,tvalloader, sampler_strain, sampler_ttrain
 
 
-def compile_data_mapping_source(version, dataroot, data_aug_conf, grid_conf,nsweeps,  domain_gap,source,target,  bsz,nworkers,flip=False):
+def compile_data_mapping_source(version, dataroot, data_aug_conf, grid_conf,nsweeps,  domain_gap,source,target,  bsz,nworkers,flip=False, is_distributed=False):
+    
     nusc = NuScenes(version=version,
                     dataroot=dataroot,
                     verbose=False)
@@ -650,16 +659,20 @@ def compile_data_mapping_source(version, dataroot, data_aug_conf, grid_conf,nswe
                       grid_conf=grid_conf, nsweeps=nsweeps,
                       domain_gap=domain_gap, domain=target, domain_type='tval')
 
+    sampler_strain = DistributedSampler(straindata, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=True) if is_distributed else None
+
     strainloader = torch.utils.data.DataLoader(straindata, batch_size=bsz,
-                                               shuffle=True,
                                                num_workers=nworkers,
+                                               sampler=sampler_strain, 
                                                drop_last=True,
                                                worker_init_fn=worker_rnd_init
                                                )
+
     tvalloader = torch.utils.data.DataLoader(tvaldata, batch_size=bsz,
-                                             shuffle=False,
+                                             shuffle=False, 
                                              num_workers=nworkers)
-    return strainloader,tvalloader
+
+    return strainloader,tvalloader, sampler_strain
 
 def compile_data_mapping_val(version, dataroot, data_aug_conf, grid_conf,nsweeps,  domain_gap,source,target,  bsz,nworkers,flip=False):
     nusc = NuScenes(version=version,
@@ -670,7 +683,6 @@ def compile_data_mapping_val(version, dataroot, data_aug_conf, grid_conf,nsweeps
     tvaldata = MappingNuscData(nusc, is_train=False, data_aug_conf=data_aug_conf,
                       grid_conf=grid_conf, nsweeps=nsweeps,
                       domain_gap=domain_gap, domain=target, domain_type='tval')
-
 
     tvalloader = torch.utils.data.DataLoader(tvaldata, batch_size=bsz,
                                              shuffle=False,

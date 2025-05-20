@@ -14,6 +14,7 @@ from torch.optim import SGD, AdamW,Adam
 from torch.optim.lr_scheduler import MultiStepLR,StepLR
 from Our.confusion import BinaryConfusionMatrix,singleBinary
 score_th = 0.5
+
 class SegmentationLoss(nn.Module):
     def __init__(self, class_weights, ignore_index=255, use_top_k=False,
                  top_k_ratio=1.0, future_discount=1.0,weight=1.0):
