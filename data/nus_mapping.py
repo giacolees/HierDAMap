@@ -123,8 +123,8 @@ class MappingNuscData(torch.utils.data.Dataset):
                 'v1.0-trainval': {True: 'train', False: 'val'},
                 'v1.0-mini': {True: 'mini_train', False: 'mini_val'},
             }[self.nusc.version][self.is_train]
-
-        scenes = create_splits_scenes()[split]
+        
+        scenes = create_splits_scenes(verbose=False)[split]
 
         return scenes
 
@@ -613,9 +613,11 @@ def compile_data_mapping(version, dataroot, data_aug_conf, grid_conf,nsweeps,  d
     straindata = MappingNuscData(nusc, is_train=True, data_aug_conf=data_aug_conf,
                         grid_conf=grid_conf, nsweeps=nsweeps,
                         domain_gap=domain_gap, domain=source, domain_type='strain')
+
     ttraindata =FlipMappingNuscData(nusc, is_train=True, data_aug_conf=data_aug_conf,
                                  grid_conf=grid_conf, nsweeps=nsweeps,
                                  domain_gap=domain_gap, domain=target, domain_type='ttrain')
+
     tvaldata = MappingNuscData(nusc, is_train=False, data_aug_conf=data_aug_conf,
                       grid_conf=grid_conf, nsweeps=nsweeps,
                       domain_gap=domain_gap, domain=target, domain_type='tval')

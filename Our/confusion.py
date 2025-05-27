@@ -30,7 +30,9 @@ def singleBinary(preds, labels, mask=None,dim=6):
     # if not valid.any():
     #     return iou,0
     miou= float(iou.mean())
+
     return iou,miou
+
 class BinaryConfusionMatrix(object):
 
     def __init__(self, num_class):

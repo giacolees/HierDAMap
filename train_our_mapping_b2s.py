@@ -1,4 +1,7 @@
 import os
+
+os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
+
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -16,8 +19,10 @@ from torch.optim import SGD, AdamW, Adam
 from torch.optim.lr_scheduler import MultiStepLR, StepLR
 from Our.confusion import BinaryConfusionMatrix, singleBinary
 from Our.loss import SegmentationLoss
-from utils import distributed_context, get_rank
+from utils import distributed_context, get_rank, get_latest_model_path, save_checkpoint
 from torch.utils.tensorboard import SummaryWriter
+from sklearn.metrics import jaccard_score, confusion_matrix
+import re
 
 score_th = 0.5
 
@@ -25,13 +30,14 @@ def get_val_info(model, valloader, device, use_tqdm=True):
     total_intersect = 0.0
     total_union = 0
     confusion_c = BinaryConfusionMatrix(1)
-    print('running eval...')
+
     loader = tqdm(valloader) if use_tqdm else valloader
+
     with torch.no_grad():
         for batch in loader:
             allimgs, rots, trans, intrins, post_rots, post_trans, lidars, binimgs,_ = batch
 
-            preds, _, _, _, _, _, pred_car = model(allimgs.to(device), rots.to(device),trans.to(device), intrins.to(device),
+            preds, _, _, _, _, _, pred_car = model(allimgs.to(device,), rots.to(device),trans.to(device), intrins.to(device),
                          post_rots.to(device),post_trans.to(device), lidars.to(device), )
 
             # iou
@@ -41,29 +47,25 @@ def get_val_info(model, valloader, device, use_tqdm=True):
             scores_c = pred_car.cpu().sigmoid()
             confusion_c.update(scores_c > score_th, (binimgs['car']) > 0)
 
-
     iou = total_intersect / (total_union+1e-7)
     miou = torch.mean(iou[1:])
+
     return {'iou': iou,'miou': miou,'miou_car': confusion_c.mean_iou}
-
-
-
 
 def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_gap, source, target, bsz, nworkers, lr, weight_decay, nepochs,
           max_grad_norm=5.0, gpuid=0, use_tqdm=True):
+
     if not os.path.exists(logdir):
         os.mkdir(logdir)
+
     logging.basicConfig(filename=os.path.join(logdir, "results.log"),
-                        filemode='w',
+                        filemode='a',
                         format='%(asctime)s: %(message)s',
                         datefmt='%Y-%m-%d %H:%M:%S',
                         level=logging.INFO)
     logging.getLogger('shapely.geos').setLevel(logging.CRITICAL)
     logger = logging.getLogger()
     logger.addHandler(logging.StreamHandler(sys.stdout))
-
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
 
     # Set up data loaders
     strainloader, ttrainloader, tvalloader, sampler_strain, sampler_ttrain, sampler_tval = compile_data_mapping(
@@ -72,7 +74,6 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
     )
     
     datalen = min(len(strainloader), len(ttrainloader))
-
     if (dist.is_initialized() == False):
         strainloader = tqdm(strainloader)
         ttrainloader = tqdm(ttrainloader)
@@ -98,7 +99,7 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
         
         # Get local rank for logging
         local_rank = get_rank()
-        logger.info(f"Initialized process with rank {local_rank}")
+        print(f"Initialized process with rank {local_rank}")
 
     # Set up loss functions
     depth_weights = torch.Tensor([2.4, 1.2, 1.0, 1.1, 1.2, 1.4, 1.8, 2.3, 2.7, 3.5,
@@ -113,7 +114,7 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
     loss_car = Dice_Loss().to(device)
     
     # Set up optimizer and scheduler
-    opt = AdamW(student_model.parameters(), lr=lr)
+    opt = AdamW(student_model.parameters(), lr=lr, weight_decay=weight_decay)
     sched = StepLR(opt, 10, 0.1)
     
     # Configuration for consistency ramp-up
@@ -122,12 +123,64 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
     # Initial weight and counters
     wp = 0.5
     loss_nan_counter = 0
+    
+    # Find latest checkpoint and resume if available
+    start_epoch = 1
+    checkpoint_path = None
+    
+    # Only rank 0 searches for checkpoints to avoid file system conflicts
+    if not dist.is_initialized() or get_rank() == 0:
+        checkpoint_path, latest_epoch = get_latest_model_path(logdir)
+        logger.info(f"Found checkpoint: {checkpoint_path} from epoch {latest_epoch}")
+
+    # Broadcast checkpoint path from rank 0 to other processes
+    if dist.is_initialized():
+        # Create a list for broadcasting
+        checkpoint_list = [checkpoint_path]
+        dist.broadcast_object_list(checkpoint_list, src=0)
+        checkpoint_path = checkpoint_list[0]
+        
+        # Ensure all processes are synchronized
+        dist.barrier()
+    
+    # Load checkpoint if available
+    if checkpoint_path is not None:
+        logger.info(f"Loading checkpoint from: {checkpoint_path}")
+        
+        # Load checkpoint to CPU first to avoid OOM issues with large models
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        # Load model state dicts
+        if dist.is_initialized():
+            # For DDP, load to module first
+            student_model.module.load_state_dict(checkpoint['student_model'])
+            teacher_model.module.load_state_dict(checkpoint['teacher_model'])
+        else:
+            student_model.load_state_dict(checkpoint['student_model'])
+            teacher_model.load_state_dict(checkpoint['teacher_model'])
+            
+        # Load optimizer and scheduler states
+        opt.load_state_dict(checkpoint['optimizer'])
+        sched.load_state_dict(checkpoint['scheduler'])
+        
+        # Load other training states
+        start_epoch = checkpoint['epoch'] + 1
+        loss_nan_counter = checkpoint.get('loss_nan_counter', 0)
+        wp = checkpoint.get('wp', 0.5)
+        
+        logger.info(f"Resumed training from epoch {start_epoch}")
+    
+    # Ensure start_epoch is synced across processes
+    if dist.is_initialized():
+        start_epoch_tensor = torch.tensor([start_epoch], device=device)
+        dist.broadcast(start_epoch_tensor, src=0)
+        start_epoch = start_epoch_tensor.item()
+        
+        # Additional sync barrier
+        dist.barrier()
 
     # Start training loop
-    for epo in range(1, nepochs + 1):
-
-        start_event.record()
-
+    for epo in range(start_epoch, nepochs + 1):
         # Synchronize at epoch start
         if dist.is_initialized():
             dist.barrier()
@@ -152,7 +205,7 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
         # Training loop for current epoch
         for batch_idx, (batch_strain_data, batch_ttrain_data) in enumerate(zip(strainloader, ttrainloader)):
             
-            # Process source domain data (student)
+            # Process source domain data
             imgs, rots, trans, intrins, post_rots, post_trans, lidars, binimgs_s, seg_mask_s = batch_strain_data
             
             # Move data to device
@@ -185,6 +238,15 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
             loss_f = loss_final(preds, binimgs)
             loss_f_car = loss_car(pred_car, binimgs_car)
             loss_p = wp * loss_pv(pv_out, seg_mask_gpu)
+
+            loss_bev_t = 0.0
+            loss_t = 0.0
+            iou_ss_t = torch.zeros(4)
+            iou_st_t = torch.zeros(4)
+            iou_tt_t = torch.zeros(4)
+            miou_car_ss_t = 0.0
+            miou_car_st_t = 0.0
+            miou_car_tt_t = 0.0
             
             # Handle depth loss
             lidars_gpu = lidars.to(device, non_blocking=True)
@@ -212,16 +274,10 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
             
             # Teacher prediction on target domain (no_grad)
             with torch.no_grad():
-                # Important: ALWAYS detach teacher outputs to prevent gradient flow
                 preds_un_ori, _, _, x_bev_un_ori, _, mask_mini_un_ori, pred_car_ori = teacher_model(
                     un_img_ori_gpu, un_rots_gpu, un_trans_gpu, un_intrins_gpu,
                     un_post_rots_ori_gpu, un_post_trans_ori_gpu, None
                 )
-                
-                # Explicitly detach all teacher outputs to ensure no gradient flow
-                preds_un_ori = preds_un_ori.detach()
-                x_bev_un_ori = x_bev_un_ori.detach()
-                pred_car_ori = pred_car_ori.detach()
             
             # Process segmentation mask for target
             seg_mask_un = rearrange(seg_mask_t.mean(dim=-1), 'b n c h w -> (b n) c h w')
@@ -264,6 +320,7 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
             else:
                 loss_nan_counter += 1
             
+
             # Optimization step
             opt.zero_grad()
             loss.backward()
@@ -277,9 +334,11 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
             # EMA update for teacher model
             alpha = min(1.0 - 1.0 / (iteration + 1), 0.999)  # when iteration>=999, alpha==0.999
             
+            if dist.is_initialized():
+                dist.barrier()
+
             # Perform EMA update for teacher model
             with torch.no_grad():
-
                 # Get state dictionaries with proper handling for DDP
                 if dist.is_initialized():
                     student_dict = student_model.module.state_dict()
@@ -290,9 +349,8 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
                 
                 # Update teacher parameters using EMA
                 for k in teacher_dict.keys():
-                    if k.find('num_batches_tracked') == -1:  # Skip batch norm statistics
-                        teacher_dict[k] = teacher_dict[k] * alpha + student_dict[k] * (1 - alpha)
-                
+                    teacher_dict[k] = teacher_dict[k] * alpha + student_dict[k] * (1 - alpha)
+
                 # Load updated weights back to teacher model
                 if dist.is_initialized():
                     teacher_model.module.load_state_dict(teacher_dict)
@@ -301,31 +359,87 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
 
             if dist.is_initialized():
                 dist.barrier()
+
+            #Student Model on Source 
+            _, _, iou_ss = get_batch_iou_mapping(onehot_encoding_mapping(preds), binimgs_s['iou'].to(device))
+            #Student Model on Target
+            _, _, iou_st = get_batch_iou_mapping(onehot_encoding_mapping(preds_un), un_binimgs_t['iou'].to(device))
+            #Teacher Model on Target
+            _, _, iou_tt = get_batch_iou_mapping(onehot_encoding_mapping(preds_un_ori), un_binimgs_t['iou'].to(device))
+            #Student Model on Source car
+            iou_car_ss, miou_car_ss = singleBinary(pred_car.sigmoid() > score_th, binimgs_car > 0, dim=1)
+            #Student Model on Target car
+            iou_car_st, miou_car_st = singleBinary(pred_car_un.sigmoid() > score_th, un_binimgs_car > 0, dim=1)
+            #Teacher Model on Target car
+            iou_car_tt, miou_car_tt = singleBinary(pred_car_ori.sigmoid() > score_th, un_binimgs_car > 0, dim=1)
+
+            loss_bev_t += loss_bev.item()
+            loss_t += loss.item()
+            iou_ss_t += iou_ss
+            iou_st_t += iou_st
+            iou_tt_t += iou_tt
+            miou_car_ss_t += miou_car_ss
+            miou_car_st_t += miou_car_st
+            miou_car_tt_t += miou_car_tt
             
             # Logging (only from main process)
-            if (not dist.is_initialized() or get_rank() == 0):
-                # Calculate IoU metrics
-                _, _, iou = get_batch_iou_mapping(onehot_encoding_mapping(preds), binimgs_s['iou'].to(device))
-                _, _, iou_un = get_batch_iou_mapping(onehot_encoding_mapping(preds_un_ori), un_binimgs_t['iou'].to(device))
-                
-                # Calculate car IoU
-                iou_car, miou_car = singleBinary(pred_car_ori.sigmoid() > score_th, un_binimgs_car > 0, dim=1)
-                
+            if (not dist.is_initialized() or get_rank() == 0) and batch_idx > 0 and batch_idx % 17 == 0:
+
                 # Log information
                 logger.info(f"EVAL[{int(epo):>3d}]: [{batch_idx:>4d}/{datalen}]:    "
-                            f"lr {opt.param_groups[0]['lr']:>.2e}   "
-                            f"w1 {w1:>7.4f}   "
-                            f"loss: {loss.item():>7.4f}   "
-                            f"loss_bev: {loss_bev.item():>7.4f}   "
-                            f"mIOU_car: {miou_car:>7.4f}  "
-                            f"tIOU: {np.array2string(iou[1:].cpu().numpy(), precision=3, floatmode='fixed')}  "
-                            f"IOU_un: {np.array2string(iou_un[1:].cpu().numpy(), precision=3, floatmode='fixed')}  "
+                            f"lr: {opt.param_groups[0]['lr']:>.2e}   "
+                            f"w1: {w1:>7.4f}   "
+                            f"alpha: {alpha}   "
+                            f"loss: {loss_t:>7.4f}   "
+                            f"loss_bev: {loss_bev_t:>7.4f}   "
+                            f"mIOU_car_ss: {(miou_car_ss_t/batch_idx):>7.4f}   "
+                            f"mIOU_car_st: {(miou_car_st_t/batch_idx):>7.4f}   "
+                            f"mIOU_car_tt: {(miou_car_tt_t/batch_idx):>7.4f}   "
+                            f"IOU Student on Source: {np.array2string((iou_ss_t/batch_idx).cpu().numpy(), precision=3, floatmode='fixed')}   "
+                            f"IOU Student on Target: {np.array2string((iou_st_t/batch_idx).cpu().numpy(), precision=3, floatmode='fixed')}   "
+                            f"IOU Teacher on Target : {np.array2string((iou_tt_t/batch_idx).cpu().numpy(), precision=3, floatmode='fixed')}   "
                             )
+            
+            # Save intermediate checkpoint every 50 batches or at a predefined frequency
+            if (not dist.is_initialized() or get_rank() == 0) and batch_idx > 0 and batch_idx % 100 == 0:
+                # Create intermediate checkpoint
+                save_checkpoint(
+                    logdir,
+                    epo,
+                    batch_idx,
+                    student_model,
+                    teacher_model,
+                    opt,
+                    sched,
+                    loss_nan_counter,
+                    wp,
+                    is_distributed=dist.is_initialized(),
+                    checkpoint_name=f"checkpoint_{epo}_batch_{batch_idx}.pt"
+                )
+                logger.info(f"Saved intermediate checkpoint at epoch {epo}, batch {batch_idx}")
             
             iteration += 1
         
         # Step scheduler at the end of epoch
         sched.step()
+        
+        # Save checkpoint at the end of each epoch
+        if not dist.is_initialized() or get_rank() == 0:
+            # Create full checkpoint
+            save_checkpoint(
+                logdir,
+                epo,
+                0,  # batch_idx=0 for end of epoch
+                student_model,
+                teacher_model,
+                opt,
+                sched,
+                loss_nan_counter,
+                wp,
+                is_distributed=dist.is_initialized(),
+                checkpoint_name=f"checkpoint_{epo}.pt"
+            )
+            logger.info(f"Saved checkpoint at end of epoch {epo}")
         
         # Validation after each epoch (only on main process)
         if not dist.is_initialized() or get_rank() == 0:
@@ -335,13 +449,13 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
             # Log validation results
             logger.info(f"TargetVAL[{epo:>2d}]:    "
                         f"mIOU_car: {val_info['miou_car']:>7.4f}  "
-                        f"TargetIOU: {np.array2string(val_info['iou'][1:].cpu().numpy(), precision=3, floatmode='fixed')}  "
+                        f"TargetIOU: {np.array2string(val_info['iou'][1:].cpu().numpy(), precision=5, floatmode='fixed')}  "
                         f"mIOU: {val_info['miou']:>7.4f}  "
                         )
             
-            # Save model checkpoint
+            # Save final model for evaluation (different from checkpoints)
             mname = os.path.join(logdir, f"model{epo}.pt")
-            print('saving', mname)
+            print('saving model for evaluation', mname)
             
             # Save state dict with proper handling for DDP
             if dist.is_initialized():
@@ -355,13 +469,10 @@ def train(logdir, grid_conf, data_aug_conf, version, dataroot, nsweeps, domain_g
         if dist.is_initialized():
             dist.barrier()
 
-        end_event.record()
-        elapsed_time = start_event.elapsed_time(end_event)
-        print(f"Execution time: {elapsed_time:.2f} ms")
-
+        
 
 if __name__ == '__main__':
-    version =  'v1.0-mini'
+    version =   'v1.0-trainval-t'#
     grid_conf = {
         'xbound': [-30.0, 30.0, 0.15],
         'ybound': [-15.0, 15.0, 0.15],
@@ -380,7 +491,7 @@ if __name__ == '__main__':
                      'Aug_mode': 'hard',  # 'simple',#
                      'backbone': "efficientnet-b0",
                      }
-    b = 10
+    b = 12
     lr = 1e-3*b/4
     source_name_list = ['boston', 'singapore', 'day', 'dry']
     source = source_name_list[0]
@@ -405,10 +516,10 @@ if __name__ == '__main__':
         # Print GPU info
         print(f"Process {rank} using GPU: {current_gpu} ({torch.cuda.get_device_name(current_gpu)})")
 
-        train(logdir='./ours_mapping_' + source+'_'+target+'_2', version=version, dataroot='./nuscenes_mini',
+        train(logdir='./ours_mapping_' + source+'_'+target+'_8', version=version, dataroot='/davinci-1/home/dnazarpour/spoke_5/data/nuscenes',
             grid_conf=grid_conf, data_aug_conf=data_aug_conf,
             domain_gap=True, source=source, target=target, nsweeps=3,
-            bsz=b, nworkers=6, lr=lr, weight_decay=1e-2, nepochs=50, gpuid=idx_gpu, use_tqdm=True)
+            bsz=b, nworkers=6, lr=lr, weight_decay=1e-2, nepochs=30, gpuid=idx_gpu, use_tqdm=True)
 
         if rank == 0:
             print("Benchmark finished.")
